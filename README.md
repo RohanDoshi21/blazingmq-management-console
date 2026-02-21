@@ -328,9 +328,3 @@ The console is designed to run behind a reverse proxy (nginx, Caddy, Traefik). S
 5. Open a Pull Request
 
 ---
-
-<div align="center">
-
-**Made with ❤️ by [Rohan Doshi](https://github.com/RohanDoshi21)**
-
-</div>

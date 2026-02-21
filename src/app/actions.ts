@@ -10,6 +10,26 @@
 import { revalidatePath } from "next/cache";
 import { cookies } from "next/headers";
 import * as broker from "@/lib/broker-client";
+import { Producer, Consumer, AckResult } from "blazingmq-node";
+
+// Map AckResult enum value to a human-readable label
+function ackResultLabel(status: AckResult): string {
+  const labels: Record<number, string> = {
+    [AckResult.SUCCESS]: "SUCCESS",
+    [AckResult.UNKNOWN]: "UNKNOWN",
+    [AckResult.TIMEOUT]: "TIMEOUT",
+    [AckResult.NOT_CONNECTED]: "NOT_CONNECTED",
+    [AckResult.CANCELED]: "CANCELED",
+    [AckResult.NOT_SUPPORTED]: "NOT_SUPPORTED",
+    [AckResult.REFUSED]: "REFUSED",
+    [AckResult.INVALID_ARGUMENT]: "INVALID_ARGUMENT",
+    [AckResult.NOT_READY]: "NOT_READY",
+    [AckResult.LIMIT_MESSAGES]: "LIMIT_MESSAGES",
+    [AckResult.LIMIT_BYTES]: "LIMIT_BYTES",
+    [AckResult.STORAGE_FAILURE]: "STORAGE_FAILURE",
+  };
+  return labels[status as number] ?? `STATUS(${status})`;
+}
 
 // ============================================================================
 // Action Result Type
@@ -284,5 +304,137 @@ export async function saveDashboardSettingsAction(
           ? err.message
           : "Failed to save dashboard settings",
     };
+  }
+}
+
+// ============================================================================
+// Message Actions — Publish & Consume
+// ============================================================================
+
+export type AckMode = "ack" | "nack_requeue";
+
+export interface ConsumedMessage {
+  guid: string;
+  payload: string;
+  payloadSize: number;
+  properties: Record<string, string>;
+  timestamp: string;
+  ackMode: AckMode;
+  /** Index in the batch (1-based) for display */
+  index: number;
+}
+
+export async function publishMessageAction(
+  queueUri: string,
+  payload: string,
+  propertiesJson: string,
+): Promise<ActionResult> {
+  const config = await broker.getConnectionConfig();
+  const brokerUri = `tcp://${config.host}:${config.port}`;
+  const producer = new Producer({ broker: brokerUri });
+  try {
+    await producer.start();
+    await producer.openQueue(queueUri);
+    let properties: Record<string, string> = {};
+    if (propertiesJson.trim()) {
+      try {
+        properties = JSON.parse(propertiesJson);
+      } catch {
+        return { success: false, message: "Invalid properties JSON" };
+      }
+    }
+    const ack = await producer.publishAndWait(
+      { queueUri, payload, properties },
+      config.timeout,
+    );
+    revalidatePath(`/queues/${encodeURIComponent(queueUri)}`);
+    revalidatePath("/queues");
+    // Serialize only plain values — ack.guid is a Buffer (Uint8Array), not serializable
+    const statusLabel = ackResultLabel(ack.status);
+    return {
+      success: ack.isSuccess,
+      message: `Message published successfully. GUID: ${ack.guidHex}, Status: ${statusLabel}`,
+      data: { guidHex: ack.guidHex, status: statusLabel, queueUri: ack.queueUri },
+    };
+  } catch (err: unknown) {
+    return {
+      success: false,
+      message: err instanceof Error ? err.message : "Failed to publish message",
+    };
+  } finally {
+    try { await producer.stop(); } catch { /* ignore cleanup errors */ }
+  }
+}
+
+export async function consumeMessagesAction(
+  queueUri: string,
+  maxMessages: number,
+  waitMs: number,
+  ackMode: AckMode = "ack",
+): Promise<ActionResult & { messages?: ConsumedMessage[] }> {
+  const config = await broker.getConnectionConfig();
+  const brokerUri = `tcp://${config.host}:${config.port}`;
+
+  const collected: ConsumedMessage[] = [];
+  let index = 1;
+
+  const consumer = new Consumer({
+    broker: brokerUri,
+    autoConfirm: false,
+    onMessage: (msg, handle) => {
+      // msg.data and msg.guid are Buffers — convert to plain serializable values
+      const payload = msg.data.toString("utf8");
+      const properties: Record<string, string> = {};
+      if (msg.properties) {
+        for (const [k, entry] of msg.properties.entries()) {
+          const v = entry.value;
+          properties[k] = Buffer.isBuffer(v) ? v.toString("hex") : String(v);
+        }
+      }
+      collected.push({
+        guid: msg.guidHex,
+        payload,
+        payloadSize: msg.data.length,
+        properties,
+        timestamp: new Date().toISOString(),
+        ackMode,
+        index: index++,
+      });
+      // ack = confirm (removes from queue); nack_requeue = skip confirm (broker redelivers)
+      if (ackMode === "ack") {
+        handle.confirm();
+      }
+      // nack_requeue: intentionally NOT calling handle.confirm() — message stays in queue
+    },
+  });
+
+  try {
+    await consumer.start();
+    await consumer.subscribe({ queueUri });
+
+    // Wait for messages to arrive (up to waitMs), stop early when we hit maxMessages
+    const elapsed = await new Promise<number>((resolve) => {
+      const start = Date.now();
+      const interval = setInterval(() => {
+        if (collected.length >= maxMessages || Date.now() - start >= waitMs) {
+          clearInterval(interval);
+          resolve(Date.now() - start);
+        }
+      }, 50);
+    });
+
+    return {
+      success: true,
+      message: `Consumed ${collected.length} message${collected.length !== 1 ? "s" : ""} in ${elapsed}ms`,
+      messages: collected,
+    };
+  } catch (err: unknown) {
+    return {
+      success: false,
+      message: err instanceof Error ? err.message : "Failed to consume messages",
+      messages: [],
+    };
+  } finally {
+    try { await consumer.stop(); } catch { /* ignore cleanup errors */ }
   }
 }
