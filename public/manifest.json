@@ -1,0 +1,19 @@
+{
+  "name": "BlazingMQ Management Console",
+  "short_name": "BlazingMQ Console",
+  "description": "A professional, real-time management UI for BlazingMQ message brokers",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#020617",
+  "theme_color": "#0f172a",
+  "orientation": "landscape-primary",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "any",
+      "type": "image/x-icon"
+    }
+  ],
+  "author": "Rohan Doshi",
+  "homepage_url": "https://github.com/RohanDoshi21/blazingmq-management-console"
+}
